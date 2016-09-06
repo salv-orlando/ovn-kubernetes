@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--overlay', action='store_true')
     parser.add_argument('--underlay', action='store_true')
     parser.add_argument('--openstack', action='store_true')
+    parser.add_argument('--watch-policies', action='store_true')
 
     # Since our instructions asks to do a 'pip install ovs',
     # for python libraries, we do not know how OVS core
@@ -73,7 +74,7 @@ def main():
 
     ovs.daemon.daemonize()
 
-    watcher.start_threads()
+    watcher.start_threads(args.watch_policies)
 
 
 if __name__ == '__main__':

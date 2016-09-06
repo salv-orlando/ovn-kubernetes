@@ -33,15 +33,23 @@ class Event(object):
         self.metadata = metadata
 
 
+class NSEvent(Event):
+    pass
+
+
+class NPEvent(Event):
+    pass
+
+
 @six.add_metaclass(abc.ABCMeta)
 class BaseProcessor(object):
 
     _instance = None
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls, *args):
         if cls._instance is None:
-            cls._instance = cls()
+            cls._instance = cls(*args)
         return cls._instance
 
     def __init__(self):

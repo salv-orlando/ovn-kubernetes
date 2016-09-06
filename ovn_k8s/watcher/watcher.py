@@ -25,7 +25,9 @@ from ovn_k8s.common import kubernetes
 from ovn_k8s.watcher import pod_watcher
 from ovn_k8s.watcher import service_watcher
 from ovn_k8s.watcher import endpoint_watcher
+from ovn_k8s.watcher import namespace_watcher
 from ovn_k8s.processor import conn_processor
+from ovn_k8s.processor import policy_processor
 
 vlog = ovs.vlog.Vlog("watcher")
 exiting = False
@@ -114,19 +116,31 @@ def _create_k8s_endpoint_watcher():
     return watcher
 
 
-def start_threads():
+def _create_k8s_namespace_watcher():
+    namespace_stream = kubernetes.watch_namespaces(variables.K8S_API_SERVER)
+    watcher = namespace_watcher.NamespaceWatcher(namespace_stream)
+    return watcher
+
+
+def start_threads(watch_policies=False):
     pool = greenpool.GreenPool()
     pool.spawn(_unixctl_run)
     pool.spawn(conn_processor.run_processor)
+    pool.spawn(policy_processor.run_processor, pool)
 
     pod_watcher_inst = _create_k8s_pod_watcher()
     service_watcher_inst = _create_k8s_service_watcher()
     endpoint_watcher_inst = _create_k8s_endpoint_watcher()
+    namespace_watcher_inst = _create_k8s_namespace_watcher()
 
     pool.spawn(_process_func, pod_watcher_inst, _create_k8s_pod_watcher)
     pool.spawn(_process_func, service_watcher_inst,
                _create_k8s_service_watcher)
     pool.spawn(_process_func, endpoint_watcher_inst,
                _create_k8s_endpoint_watcher)
+    if watch_policies:
+        vlog.info("Starting namespace watcher")
+        pool.spawn(_process_func, namespace_watcher_inst,
+                   _create_k8s_namespace_watcher)
 
     pool.waitall()

@@ -24,6 +24,7 @@ from ovn_k8s.common import variables
 
 CA_CERTIFICATE = "/etc/openvswitch/k8s-ca.crt"
 vlog = ovs.vlog.Vlog("kubernetes")
+K8S_ISOLATION_ANN = 'net.beta.kubernetes.io/network-policy'
 
 
 def _get_api_params():
@@ -71,6 +72,8 @@ def _stream_api(url):
 
     if response.status_code != 200:
         # TODO: raise here
+        vlog.err("Failure while invoking stream API (%d): %s" %
+                 (response.status_code, response.text))
         return
     return response.iter_lines(chunk_size=10, delimiter='\n')
 
@@ -90,6 +93,28 @@ def watch_services(server):
 
 def watch_endpoints(server):
     return _watch_resource(server, 'endpoints')
+
+
+def watch_namespaces(server):
+    return _watch_resource(server, 'namespaces')
+
+
+def watch_network_policies(server, namespace):
+    url = ("http://%s/apis/extensions/v1beta1/namespaces/"
+           "%s/networkpolicies?watch=True") % (server, namespace)
+    return _stream_api(url)
+
+
+def get_ns_annotations(server, namespace):
+    url = "http://%s/api/v1/namespaces/%s" % (server, namespace)
+    response = requests.get(url)
+    if not response:
+        # TODO: raise here
+        return
+    json_response = response.json()
+    annotations = json_response['metadata'].get('annotations')
+    vlog.dbg("Annotations for namespace %s: %s" % (namespace, annotations))
+    return annotations
 
 
 def get_pod_annotations(server, namespace, pod):
@@ -191,3 +216,18 @@ def get_all_pods(server):
 def get_all_services(server):
     url = "%s/api/v1/services" % (server)
     return _get_objects(url, 'all', 'service', "all_services")
+
+
+def is_namespace_isolated(server, namespace):
+    annotations = get_ns_annotations(server, namespace)
+    isolation = annotations and annotations.get(K8S_ISOLATION_ANN)
+    # Interpret anythingthat is not "on" as "off" (even garbage)
+    try:
+        isolation_json = json.loads(isolation)
+        ingress = isolation_json.get('ingress', {})
+        if ingress.get('isolation') == 'DefaultDeny':
+            return True
+        return False
+    except (ValueError, TypeError):
+        vlog.dbg("Invalid json data for isolation annotation: %s" % isolation)
+        return False
