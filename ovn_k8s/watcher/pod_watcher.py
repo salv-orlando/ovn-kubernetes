@@ -17,6 +17,7 @@ import json
 import ovs.vlog
 import ovn_k8s.processor
 from ovn_k8s.processor import conn_processor
+from ovn_k8s.processor import policy_processor as pp
 from ovn_k8s.common import util
 
 vlog = ovs.vlog.Vlog("pod_watcher")
@@ -33,6 +34,12 @@ class PodWatcher(object):
                                      source=pod_name,
                                      metadata=pod_data)
         conn_processor.get_event_queue().put(ev)
+
+    def _send_policy_event(self, event_type, pod_name, pod_data):
+        ev = ovn_k8s.processor.Event(event_type,
+                                     source=pod_name,
+                                     metadata=pod_data)
+        pp.get_event_queue().put(ev)
 
     def _update_pod_cache(self, event_type, cache_key, pod_data):
         # Remove item from cache if it was deleted
@@ -66,17 +73,29 @@ class PodWatcher(object):
         self._update_pod_cache(event_type, cache_key, pod_data)
 
         has_conn_event = False
+        has_policy_event = False
         if not cached_pod:
             has_conn_event = True
+            has_policy_event = True
         elif event_type == 'DELETED':
             has_conn_event = True
+            has_policy_event = True
         else:
-            return
+            label_changes = util.has_changes(
+                pod_data['metadata'].get('labels', {}),
+                cached_pod['metadata'].get('labels', {}))
+            if label_changes:
+                vlog.dbg("Detected changes in pod labels: %s" % label_changes)
+                has_policy_event = True
 
         if has_conn_event:
             vlog.dbg("Sending connectivity event for event %s on pod %s"
                      % (event_type, pod_name))
             self._send_connectivity_event(event_type, pod_name, pod_data)
+        if has_policy_event:
+            vlog.dbg("Sending policy event for event %s on pod %s" %
+                     (event_type, pod_name))
+            self._send_policy_event(event_type, pod_name, pod_data)
 
     def process(self):
         util.process_stream(self._pod_stream,
