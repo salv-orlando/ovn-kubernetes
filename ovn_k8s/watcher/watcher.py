@@ -125,6 +125,8 @@ def _create_k8s_namespace_watcher():
 def start_threads(watch_policies=False):
     pool = greenpool.GreenPool()
     pool.spawn(_unixctl_run)
+
+    # Spawn processors
     pool.spawn(conn_processor.run_processor)
     pool.spawn(policy_processor.run_processor, pool)
 
@@ -133,6 +135,7 @@ def start_threads(watch_policies=False):
     endpoint_watcher_inst = _create_k8s_endpoint_watcher()
     namespace_watcher_inst = _create_k8s_namespace_watcher()
 
+    # Spawn watchers
     pool.spawn(_process_func, pod_watcher_inst, _create_k8s_pod_watcher)
     pool.spawn(_process_func, service_watcher_inst,
                _create_k8s_service_watcher)

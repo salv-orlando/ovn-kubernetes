@@ -32,12 +32,19 @@ class Event(object):
         self.source = source
         self.metadata = metadata
 
+    def __str__(self):
+        return "%s:%s" % (self.event_type, self.source)
+
 
 class NSEvent(Event):
     pass
 
 
 class NPEvent(Event):
+    pass
+
+
+class PodEvent(Event):
     pass
 
 

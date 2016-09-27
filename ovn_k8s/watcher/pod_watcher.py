@@ -30,15 +30,15 @@ class PodWatcher(object):
         self.pod_cache = {}
 
     def _send_connectivity_event(self, event_type, pod_name, pod_data):
-        ev = ovn_k8s.processor.Event(event_type,
-                                     source=pod_name,
-                                     metadata=pod_data)
+        ev = ovn_k8s.processor.PodEvent(event_type,
+                                        source=pod_name,
+                                        metadata=pod_data)
         conn_processor.get_event_queue().put(ev)
 
     def _send_policy_event(self, event_type, pod_name, pod_data):
-        ev = ovn_k8s.processor.Event(event_type,
-                                     source=pod_name,
-                                     metadata=pod_data)
+        ev = ovn_k8s.processor.PodEvent(event_type,
+                                        source=pod_name,
+                                        metadata=pod_data)
         pp.get_event_queue().put(ev)
 
     def _update_pod_cache(self, event_type, cache_key, pod_data):

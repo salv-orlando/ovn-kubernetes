@@ -117,6 +117,27 @@ def get_ns_annotations(server, namespace):
     return annotations
 
 
+def get_pods_by_namespace(server, namespace, pod_selector=None):
+    url = "http://%s/api/v1/namespaces/%s/pods" % (server, namespace)
+    query_params = {}
+    if pod_selector:
+        label_selectors = []
+        for name, value in pod_selector.items():
+            label_selectors.append("%s in (%s)" % (
+                name, ",".join([item for item in value])))
+        query_params = {'labelSelector': label_selectors}
+
+    response = requests.get(url, params=query_params)
+    if not response:
+        if response.status_code == 404:
+            raise exceptions.NotFound(resource_type='namespace',
+                                      resource_id=namespace)
+        else:
+            raise Exception("Failed to fetch pods for namespace %s (%d) :%s" %
+                            (namespace, response.status_code, response.text))
+    return response.json()['items']
+
+
 def get_pod_annotations(server, namespace, pod):
     ca_certificate, api_token = _get_api_params()
     url = ("%s/api/v1/namespaces/%s/pods/%s" %
@@ -216,6 +237,27 @@ def get_all_pods(server):
 def get_all_services(server):
     url = "%s/api/v1/services" % (server)
     return _get_objects(url, 'all', 'service', "all_services")
+
+
+def get_namespace(server, namespace):
+    url = "http://%s/api/v1/namespaces/%s" \
+            % (server, namespace)
+    response = requests.get(url)
+    if not response:
+        if response.status_code == 404:
+            raise exceptions.NotFound(resource_type='namespace',
+                                      resource_id=namespace)
+        else:
+            raise Exception("Failed to fetch namespace %s (%s): %s" % (
+                namespace, response.status_code, response.text))
+    return response.json()
+
+
+def get_network_policies(server, namespace):
+    url = ("http://%s/apis/extensions/v1beta1/namespaces/"
+           "%s/networkpolicies") % (server, namespace)
+    return _get_objects(url, namespace,
+                        'networkpolicy', 'all_networkpolicies')['items']
 
 
 def is_namespace_isolated(server, namespace):
