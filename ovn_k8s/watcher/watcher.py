@@ -127,7 +127,7 @@ def start_threads(watch_policies=False):
     pool.spawn(_unixctl_run)
 
     # Spawn processors
-    pool.spawn(conn_processor.run_processor)
+    pool.spawn(conn_processor.run_processor, watch_policies)
     pool.spawn(policy_processor.run_processor, pool)
 
     pod_watcher_inst = _create_k8s_pod_watcher()

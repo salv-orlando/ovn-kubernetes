@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import ast
+import hashlib
+import json
+import shlex
 import time
 
 import ovs.vlog
@@ -22,6 +25,9 @@ import ovn_k8s.common.variables as variables
 from ovn_k8s.common.util import ovn_nbctl
 
 vlog = ovs.vlog.Vlog("overlay")
+DEFAULT_ACL_PRIORITY = 1000
+POLICY_ACL_PRIORITY = 1100
+ALL_PORTS = {"ports": "*"}
 
 
 class OvnNB(object):
@@ -29,6 +35,7 @@ class OvnNB(object):
         self.service_cache = {}
         self.logical_switch_cache = {}
         self.physical_gateway_ips = []
+        self.pseudo_acls = {}
 
     def _get_physical_gateway_ips(self):
         if self.physical_gateway_ips:
@@ -129,12 +136,15 @@ class OvnNB(object):
                                                          gateway_ip_mask}
         return (gateway_ip, mask)
 
-    def create_logical_port(self, event):
+    def _build_logical_port_name(self, namespace, pod_name):
+        return "%s_%s" % (namespace, pod_name)
+
+    def create_logical_port(self, event, create_network_policies):
         data = event.metadata
         logical_switch = data['spec']['nodeName']
         pod_name = data['metadata']['name']
         namespace = data['metadata']['namespace']
-        logical_port = "%s_%s" % (namespace, pod_name)
+        logical_port = self._build_logical_port_name(namespace, pod_name)
         if not logical_switch or not pod_name:
             vlog.err("absent node name or pod name in pod %s. "
                      "Not creating logical port" % (data))
@@ -180,12 +190,20 @@ class OvnNB(object):
             return
 
         (mac_address, ip_address) = addresses.split()
-
         namespace = data['metadata']['namespace']
         pod_name = data['metadata']['name']
 
-        ip_address_mask = "%s/%s" % (ip_address, mask)
+        if create_network_policies:
+            # Setup  policies for pod
+            self.create_pod_acls(data)
+            vlog.dbg("Pod: %s (Namespace: %s) - ACLs for policies created"
+                     % (pod_name, namespace))
+            # Add pod IP to relevant address sets
+            self.add_pod_to_address_sets(data)
+            vlog.dbg("Pod: %s (Namespace: %s) - Pod IP added to address sets"
+                     % (pod_name, namespace))
 
+        ip_address_mask = "%s/%s" % (ip_address, mask)
         annotation = {'ip_address': ip_address_mask,
                       'mac_address': mac_address,
                       'gateway_ip': gateway_ip}
@@ -201,8 +219,9 @@ class OvnNB(object):
 
         vlog.info("created logical port %s" % (logical_port))
 
-    def delete_logical_port(self, event):
+    def delete_logical_port(self, event, delete_network_policies):
         data = event.metadata
+        pod_id = data['metadata']['uid']
         pod_name = data['metadata']['name']
         namespace = data['metadata']['namespace']
         logical_port = "%s_%s" % (namespace, pod_name)
@@ -218,6 +237,16 @@ class OvnNB(object):
             return
 
         vlog.info("deleted logical port %s" % (logical_port))
+
+        if delete_network_policies:
+            # Remove ACLs for pod
+            self.delete_pod_acls(pod_id)
+            vlog.dbg("Pod: %s (Namespace: %s) - ACLs for pod removed "
+                     % (pod_name, namespace))
+            # Remove references to pod from address sets
+            self.delete_pod_from_address_sets(data)
+            vlog.dbg("Pod: %s (Namespace: %s) - Pod IP removed from address "
+                     "sets" % (pod_name, namespace))
 
     def _update_vip(self, service_data, ips):
         service_type = service_data['spec'].get('type')
@@ -438,3 +467,319 @@ class OvnNB(object):
                     except Exception as e:
                         vlog.err("sync_services: failed to remove vip %s"
                                  "from %s (%s)" % (vip, load_balancer, str(e)))
+
+    def _create_acl(self, pod_id, ls_name, lport_name, priority,
+                    match, action, **kwargs):
+        # Note: The reason rather complicated expression is to be able to set
+        # an external id for the ACL as well (acl-add won't return the ACL id)
+        kwargs['pod_id'] = pod_id
+        external_ids = " ".join('external_ids:%s=%s' % (k, v)
+                                for k, v in kwargs.items())
+        command = ('-- --id=@acl_id create ACL action=%s direction=to-lport '
+                   'priority=%d match="%s" external_ids:lport_name=%s '
+                   '%s -- add Logical_Switch %s acls @acl_id' %
+                   (action, priority, match, lport_name,
+                    external_ids, ls_name))
+        command_items = tuple(shlex.split(command))
+        ovn_nbctl(*command_items)
+
+    def remove_acls(self, pod_id, remove_default=False):
+        acls_raw = ovn_nbctl('--data=bare', '--no-heading',
+                             '--columns=_uuid,priority', 'find', 'ACL',
+                             'external_ids:pod_id=%s' % pod_id).split()
+        if not acls_raw:
+            return
+
+        # Create a list of tuples whose first element is the ACL uuid and the
+        # second one its priority
+        acls = zip(acls_raw[0::2], acls_raw[1::2])
+
+        # On delete operations the logical port is unfortunately gone... but
+        # the logical switch can be found from existing ACLs, and if there are
+        # no existing ACLs then there's just nothing to do e bonanott
+        ls_name = ovn_nbctl('--data=bare', '--no-heading', '--columns=name',
+                            'find', 'Logical_Switch',
+                            'acls{>=}%s' % acls[0][0])
+        for acl in acls:
+            if (not remove_default and
+                    int(acl[1]) == DEFAULT_ACL_PRIORITY):
+                # Do not drop the default drop rule
+                continue
+            ovn_nbctl('remove', 'Logical_Switch', ls_name, 'acls', acl[0])
+
+    def whitelist_pod_traffic(self, pod_id, namespace, pod_name):
+        lport_name = self._build_logical_port_name(namespace, pod_name)
+        lport_uuid = ovn_nbctl("--data=bare", "--no-heading",
+                               "--columns=_uuid", "find",
+                               "logical_switch_port",
+                               "name=%s" % lport_name)
+        lswitch_name = ovn_nbctl("--data=bare", "--no-heading",
+                                 "--columns=_uuid", "find",
+                                 "logical_switch",
+                                 "ports{>=}%s" % lport_uuid)
+        self._create_acl(pod_id, lswitch_name, lport_name,
+                         DEFAULT_ACL_PRIORITY,
+                         r'outport\=\=\"%s\"\ &&\ ip' % lport_name,
+                         'allow-related')
+        vlog.dbg("Pod %s (Namespace:%s): Traffic whitelisted"
+                 % (pod_name, namespace))
+
+    def policy_pod_traffic(self, pod_data, pseudo_acls):
+        pod_name = pod_data['metadata']['name']
+        pod_ns = pod_data['metadata']['namespace']
+        pod_id = pod_data['metadata']['uid']
+        # TODO(salv-orlando): do not remove the default drop in the next step
+        # and ensure the same rule is not created if already defined in the
+        # subsequent step. The current code will leave a pod without security
+        # rules or with incomplete security rules if an error occurs.
+        self.remove_acls(pod_id, remove_default=True)
+        for pseudo_acl in pseudo_acls:
+            src_match = None
+            ports_match = None
+            # NOTE: We do not validate that the protocol names are valid
+            ports_clause = pseudo_acl[1]
+            from_clause = pseudo_acl[2]
+            if from_clause != '*':
+                # '*' means every address matches and therefore no source IP
+                # match should be added to the ACL
+                src_match = r"ip4.src\=\=\{%s\}" % from_clause
+            match_items = set()
+            protocol_port_map = {}
+            for (protocol, port) in ports_clause:
+                ports = protocol_port_map.setdefault(protocol, set())
+                if port:
+                    ports.add(port)
+            for protocol, ports in protocol_port_map.items():
+                if ports:
+                    item_match_str = (r"%s.dst\=\=\{%s\}" %
+                                      (protocol.lower(), ",".join(
+                                          [str(port) for port in ports
+                                           if port is not None])))
+                else:
+                    item_match_str = protocol.lower()
+                match_items.add(item_match_str)
+            ports_match = "\ ||\ ".join(match_items)
+            lport_name = self._build_logical_port_name(pod_ns, pod_name)
+            lport_uuid = ovn_nbctl("--data=bare", "--no-heading",
+                                   "--columns=_uuid", "find",
+                                   "logical_switch_port",
+                                   "name=%s" % lport_name)
+            if ports_match and src_match:
+                policy_match = "%s\ &&\ %s" % (ports_match, src_match)
+            elif ports_match:
+                policy_match = ports_match
+            elif src_match:
+                policy_match = src_match
+            else:
+                policy_match = None
+            outport_match = r'outport\=\=\"%s\"\ &&\ ip' % lport_name
+            if policy_match:
+                match = r'%s\ &&\ %s' % (outport_match, policy_match)
+            else:
+                match = outport_match
+            vlog.dbg("Pod: %s (Namespace:%s): ACL match: %s" % (
+                pod_name, pod_ns, match))
+            ovn_acl_data = (pseudo_acl[0], match, pseudo_acl[3])
+            # TODO(salv-orlando): lswitch & lport can be easily cached
+            lswitch_name = ovn_nbctl("--data=bare", "--no-heading",
+                                     "--columns=name", "find",
+                                     "logical_switch",
+                                     "ports{>=}%s" % lport_uuid)
+            # TODO(salv-orlando): Also store policy name in external ids.
+            # It could be useful for debugging
+            self._create_acl(pod_id, lswitch_name, lport_name, *ovn_acl_data)
+
+    def build_rule_address_set_name(self, policy_name, namespace, rule_data):
+        hasher = hashlib.md5()
+        hasher.update(json.dumps(rule_data.get('ports'), ALL_PORTS))
+        rule_hash = hasher.hexdigest()
+        return "%s_%s_%s" % (policy_name, namespace, rule_hash)
+
+    def create_address_set(self, namespace, policy_data):
+        for rule in policy_data['spec']['ingress']:
+            address_set = self.build_rule_address_set_name(
+                policy_data['metadata']['name'],
+                namespace,
+                rule)
+            # First verify that the address set does not already exist
+            if not ovn_nbctl("--data=bare", "--no-heading",
+                             "--columns=_uuid", "find",
+                             "address_set", "name=%s" % address_set):
+                ovn_nbctl('create', 'address_set', 'name=%s' % address_set)
+
+    def add_to_address_set(self, pod_ip, namespace, policy_data):
+        for rule in policy_data['spec']['ingress']:
+            rule_address_set = self.build_rule_address_set_name(
+                policy_data['metadata']['name'],
+                namespace,
+                rule)
+            ovn_nbctl('--if-exists', 'add', 'address_set',
+                      rule_address_set, 'addresses', pod_ip)
+
+    def remove_from_address_set(self, pod_ip, namespace, policy_data):
+        for rule in policy_data['spec']['ingress']:
+            rule_address_set = self.build_rule_address_set_name(
+                policy_data['metadata']['name'],
+                namespace,
+                rule)
+            ovn_nbctl('--if-exists', 'remove', 'address_set',
+                      'addresses', rule_address_set, pod_ip)
+
+    def destroy_address_set(self, namespace, policy_data):
+        for rule in policy_data['spec']['ingress']:
+            address_set = self.build_rule_address_set_name(
+                policy_data['metadata']['name'],
+                namespace,
+                rule)
+            ovn_nbctl('destroy', 'address_set', address_set)
+
+    def build_pseudo_acls(self, policy_data):
+        # Build pseudo ACL list for policy
+        policy_id = policy_data['metadata']['uid']
+        # Always start with a drop all rule
+        policy_pseudo_acls = [(DEFAULT_ACL_PRIORITY, [], '*', 'drop')]
+        for rule in policy_data['spec']['ingress']:
+            ports_data = rule.get('ports', [])
+            protocol_ports = []
+            for item in ports_data:
+                protocol_ports.append((item['protocol'], item.get('port')))
+            from_data = rule.get('from')
+            if not from_data:
+                src_pod_ips = '*'
+            else:
+                rule_address_set = self.build_rule_address_set_name(
+                    policy_data['metadata']['name'],
+                    policy_data['metadata']['namespace'],
+                    rule)
+                src_pod_ips = 'address_set(%s)' % rule_address_set
+            pseudo_acl = (POLICY_ACL_PRIORITY,
+                          protocol_ports, src_pod_ips,
+                          'allow-related')
+            policy_pseudo_acls.append(pseudo_acl)
+        self.pseudo_acls[policy_id] = policy_pseudo_acls
+        return policy_pseudo_acls
+
+    def remove_pseudo_acls(self, policy_id):
+        self.pseudo_acls.pop(policy_id, None)
+
+    def _find_policies_for_pod(self, pod_data, policies):
+        pod_labels = pod_data['metadata'].get('labels', {})
+        pod_policies = []
+        for policy in policies:
+            policy_spec = policy['spec']
+            pod_selector = policy_spec.get('podSelector', {}).get(
+                'matchLabels', {})
+            # TODO(salv-orlando): Implement not only equality based selectors
+            if pod_selector:
+                for label in set(pod_labels.keys()) & set(pod_selector.keys()):
+                    if pod_labels[label] == pod_selector[label]:
+                        pod_policies.append(policy)
+                        # policy matched, move on
+                        break
+        return pod_policies
+
+    def apply_pod_policy_acls(self, pod_data, policies):
+        namespace = pod_data['metadata']['namespace']
+        pod_name = pod_data['metadata']['name']
+        pod_policies = self._find_policies_for_pod(pod_data, policies)
+        for policy in pod_policies:
+            policy_pseudo_acls = self.pseudo_acls.get(
+                policy['metadata']['uid'])
+            if not policy_pseudo_acls:
+                policy_pseudo_acls = self.build_pseudo_acls(policy)
+            self.policy_pod_traffic(pod_data, policy_pseudo_acls)
+        vlog.dbg("Pod: %s (Namespace: %s)  - ACL changes for policies"
+                 "applied" % (pod_name, namespace))
+
+    def create_pod_acls(self, pod_data):
+        namespace = pod_data['metadata']['namespace']
+        if kubernetes.is_namespace_isolated(variables.K8S_API_SERVER,
+                                            namespace):
+            policies = kubernetes.get_network_policies(
+                variables.K8S_API_SERVER, namespace)
+            self.apply_pod_policy_acls(pod_data, policies)
+        else:
+            self.whitelist_pod_traffic(pod_data['metadata']['uid'],
+                                       namespace,
+                                       pod_data['metadata']['name'])
+
+    def delete_pod_acls(self, pod_id):
+        self.remove_acls(pod_id, remove_default=True)
+
+    def _pod_matches_from_clause(self, pod_data, ns_data, policy_rule):
+        pod_labels = pod_data['metadata'].get('labels', {})
+        from_clause = policy_rule.get('from')
+        if not from_clause:
+            # Empty from clause means policy affects all pods
+            return True
+        # NOTE: In this case a missing element and an empty element have
+        # different semantics
+        if 'podsSelector' in from_clause:
+            from_pods = from_clause.get('podSelector')
+            if not from_pods:
+                # Empty pod selector means policy affect all pods in
+                # the current namespace
+                return True
+            # NOTE: the current code assumes only equality-based selectors
+            for label in set(pod_labels.keys()) & set(from_pods.keys()):
+                if pod_labels[label] == from_pods[label]:
+                    return True
+        elif 'namespaceSelector' in from_clause:
+            from_namespaces = from_clause.get('namespaceSelector')
+            if not from_namespaces:
+                # Empty namespace selector means all namespaces, and therefore
+                # the pod's one as well
+                return True
+            # NOTE: the current code assumes only equality-based selectors
+            ns_labels = ns_data['metadata'].get('labels', {})
+            for label in set(ns_labels.keys()) & set(from_namespaces.keys()):
+                if pod_labels[label] == from_namespaces[label]:
+                    return True
+        # We tried very hard, but no match was found
+        return False
+
+    def add_pod_to_address_sets(self, pod_data):
+        # Update every addresss set for rules that match the pod with the IP
+        # address of the pod
+        pod_ns = pod_data['metadata']['namespace']
+        pod_name = pod_data['metadata']['name']
+        pod_ip = pod_data['status']['podIP']
+        if not pod_ip:
+            vlog.dbg("Pod %s (Namespace %s): No IP address available, not "
+                     "updating address sets." % (pod_name, pod_ns))
+            return
+        ns_data = kubernetes.get_namespace(variables.K8S_API_SERVER, pod_ns)
+        for policy in kubernetes.get_network_policies(
+                variables.K8S_API_SERVER, pod_ns):
+            for rule in policy['spec']['ingress']:
+                if self._pod_matches_from_clause(pod_data, ns_data, rule):
+                    self.add_to_address_set(pod_ip, pod_ns, policy)
+
+    def add_pods_to_policy_address_sets(self, policy_data):
+        # Update every address sets for a given policy with all the addresses
+        # from pods matching the from clayse
+        policy_ns = policy_data['metadata']['namespace']
+        ns_data = kubernetes.get_namespace(variables.K8S_API_SERVER,
+                                           policy_ns)
+        for pod_data in kubernetes.get_pods_by_namespace(
+                variables.K8S_API_SERVER, policy_ns):
+            pod_ip = pod_data['status'].get('podIP')
+            if not pod_ip:
+                continue
+            for rule in policy_data['spec']['ingress']:
+                if self._pod_matches_from_clause(pod_data, ns_data, rule):
+                    self.add_to_address_set(pod_ip, policy_ns, policy_data)
+
+    def delete_pod_from_address_sets(self, pod_data):
+        namespace = pod_data['metadata']['namespace']
+        policies = kubernetes.get_network_policies(
+            variables.K8S_API_SERVER,
+            namespace)
+        # NOTE: Removign the pod IP from every address set is not harmful but
+        # cna be optimized by removing it only from the address sets that
+        # match the policy rule
+        for policy_data in policies:
+            self.remove_from_address_set(
+                pod_data['status']['podIP'],
+                namespace,
+                policy_data)

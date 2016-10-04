@@ -73,26 +73,21 @@ class PodWatcher(object):
         self._update_pod_cache(event_type, cache_key, pod_data)
 
         has_conn_event = False
-        has_policy_event = False
+        label_changes = False
         if not cached_pod:
             has_conn_event = True
-            has_policy_event = True
         elif event_type == 'DELETED':
             has_conn_event = True
-            has_policy_event = True
         else:
             label_changes = util.has_changes(
                 pod_data['metadata'].get('labels', {}),
                 cached_pod['metadata'].get('labels', {}))
-            if label_changes:
-                vlog.dbg("Detected changes in pod labels: %s" % label_changes)
-                has_policy_event = True
 
         if has_conn_event:
             vlog.dbg("Sending connectivity event for event %s on pod %s"
                      % (event_type, pod_name))
             self._send_connectivity_event(event_type, pod_name, pod_data)
-        if has_policy_event:
+        if label_changes:
             vlog.dbg("Sending policy event for event %s on pod %s" %
                      (event_type, pod_name))
             self._send_policy_event(event_type, pod_name, pod_data)

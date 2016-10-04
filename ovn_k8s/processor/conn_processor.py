@@ -20,13 +20,17 @@ vlog = ovs.vlog.Vlog("connprocessor")
 
 class ConnectivityProcessor(ovn_k8s.processor.BaseProcessor):
 
+    def __init__(self, do_nw_policies):
+        super(ConnectivityProcessor, self).__init__()
+        self._do_nw_policies = do_nw_policies
+
     def _process_pod_event(self, event):
         if event.event_type == "DELETED":
             vlog.dbg("Received a pod delete event %s" % (event.metadata))
-            self.mode.delete_logical_port(event)
+            self.mode.delete_logical_port(event, self._do_nw_policies)
         else:
             vlog.dbg("Received a pod ADD/MODIFY event %s" % (event.metadata))
-            self.mode.create_logical_port(event)
+            self.mode.create_logical_port(event, self._do_nw_policies)
 
     def _process_service_event(self, event):
         if event.event_type == "DELETED":
@@ -60,5 +64,5 @@ def get_event_queue():
     return ConnectivityProcessor.get_instance().event_queue
 
 
-def run_processor():
-    ConnectivityProcessor.get_instance().run()
+def run_processor(do_network_policies=False):
+    ConnectivityProcessor.get_instance(do_network_policies).run()

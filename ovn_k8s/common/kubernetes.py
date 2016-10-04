@@ -100,14 +100,23 @@ def watch_namespaces(server):
 
 
 def watch_network_policies(server, namespace):
-    url = ("http://%s/apis/extensions/v1beta1/namespaces/"
+    url = ("%s/apis/extensions/v1beta1/namespaces/"
            "%s/networkpolicies?watch=True") % (server, namespace)
     return _stream_api(url)
 
 
 def get_ns_annotations(server, namespace):
-    url = "http://%s/api/v1/namespaces/%s" % (server, namespace)
-    response = requests.get(url)
+    certificate, api_token = _get_api_params()
+    url = "%s/api/v1/namespaces/%s" % (server, namespace)
+
+    headers = {}
+    if api_token:
+        headers['Authorization'] = 'Bearer %s' % api_token
+
+    if certificate:
+        response = requests.get(url, headers=headers, verify=certificate)
+    else:
+        response = requests.get(url, headers=headers)
     if not response:
         # TODO: raise here
         return
@@ -118,7 +127,13 @@ def get_ns_annotations(server, namespace):
 
 
 def get_pods_by_namespace(server, namespace, pod_selector=None):
-    url = "http://%s/api/v1/namespaces/%s/pods" % (server, namespace)
+    certificate, api_token = _get_api_params()
+    url = "%s/api/v1/namespaces/%s/pods" % (server, namespace)
+
+    headers = {}
+    if api_token:
+        headers['Authorization'] = 'Bearer %s' % api_token
+
     query_params = {}
     if pod_selector:
         label_selectors = []
@@ -127,7 +142,11 @@ def get_pods_by_namespace(server, namespace, pod_selector=None):
                 name, ",".join([item for item in value])))
         query_params = {'labelSelector': label_selectors}
 
-    response = requests.get(url, params=query_params)
+    if certificate:
+        response = requests.get(url, headers=headers,
+                                params=query_params, verify=certificate)
+    else:
+        response = requests.get(url, headers=headers, params=query_params)
     if not response:
         if response.status_code == 404:
             raise exceptions.NotFound(resource_type='namespace',
@@ -240,9 +259,15 @@ def get_all_services(server):
 
 
 def get_namespace(server, namespace):
-    url = "http://%s/api/v1/namespaces/%s" \
-            % (server, namespace)
-    response = requests.get(url)
+    certificate, api_token = _get_api_params()
+    url = "%s/api/v1/namespaces/%s" % (server, namespace)
+    headers = {}
+    if api_token:
+        headers['Authorization'] = 'Bearer %s' % api_token
+    if certificate:
+        response = requests.get(url, headers=headers, verify=certificate)
+    else:
+        response = requests.get(url, headers=headers)
     if not response:
         if response.status_code == 404:
             raise exceptions.NotFound(resource_type='namespace',
@@ -254,7 +279,7 @@ def get_namespace(server, namespace):
 
 
 def get_network_policies(server, namespace):
-    url = ("http://%s/apis/extensions/v1beta1/namespaces/"
+    url = ("%s/apis/extensions/v1beta1/namespaces/"
            "%s/networkpolicies") % (server, namespace)
     return _get_objects(url, namespace,
                         'networkpolicy', 'all_networkpolicies')['items']

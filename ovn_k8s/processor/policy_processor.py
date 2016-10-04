@@ -30,56 +30,6 @@ class PolicyProcessor(processor.BaseProcessor):
         self._pool = pool
         self._np_watcher_threads = {}
 
-    def _pod_matches_from_clause(self, pod_data, ns_data, policy_rule):
-        pod_labels = pod_data['metadata'].get('labels', {})
-        from_clause = policy_rule.get('from')
-        if not from_clause:
-            # Empty from clause means policy affects all pods
-            return True
-        # NOTE: In this case a missing element and an empty element have
-        # different semantics
-        if 'podsSelector' in from_clause:
-            from_pods = from_clause.get('podSelector')
-            if not from_pods:
-                # Empty pod selector means policy affect all pods in
-                # the current namespace
-                return True
-            # NOTE: the current code assumes only equality-based selectors
-            for label in set(pod_labels.keys()) & set(from_pods.keys()):
-                if pod_labels[label] == from_pods[label]:
-                    return True
-        elif 'namespaceSelector' in from_clause:
-            from_namespaces = from_clause.get('namespaceSelector')
-            if not from_namespaces:
-                # Empty namespace selector means all namespaces, and therefore
-                # the pod's one as well
-                return True
-            # NOTE: the current code assumes only equality-based selectors
-            ns_labels = ns_data['metadata'].get('labels', {})
-            for label in set(ns_labels.keys()) & set(from_namespaces.keys()):
-                if pod_labels[label] == from_namespaces[label]:
-                    return True
-        # We tried very hard, but no match was found
-        return False
-
-    def _find_policies_for_pod(self, pod_data):
-        # This function return the policies for which there is a rule whose
-        # fram clause matches pod labels (or nnemspaces)
-        pod_policies = {}
-        pod_ns = pod_data['metadata']['namespace']
-        ns_data = kubernetes.get_namespace(variables.K8S_API_SERVER, pod_ns)
-        for policy in kubernetes.get_network_policies(
-                variables.K8S_API_SERVER, pod_ns):
-            matching_rules = []
-            for rule in policy['spec']['ingress']:
-                if self._pod_matches_from_clause(pod_data, ns_data, rule):
-                    matching_rules.append(rule)
-            if matching_rules:
-                policy_id = policy['metadata']['uid']
-                pod_policies[policy_id] = {'policy': policy,
-                                           'rules': matching_rules}
-        return pod_policies
-
     def _process_ns_event(self, event, affected_pods, pod_events):
         log.dbg("Processing event %s from namespace %s" % (
             event.event_type, event.source))
@@ -116,48 +66,36 @@ class PolicyProcessor(processor.BaseProcessor):
         log.dbg("Processing event %s from pod %s" % (
             event.event_type, event.source))
         pod_data = event.metadata
-        # Pods are always affected if the namespace is isolated
+        # Pods are affected only if the namespace is isolated
         if not kubernetes.is_namespace_isolated(
                 variables.K8S_API_SERVER, pod_data['metadata']['namespace']):
             log.dbg("Namespace %s for pod %s is not isolated, no further "
                     "processing required" % (pod_data['metadata']['namespace'],
                                              event.source))
-            return
-        pod_id = pod_data['metadata']['uid']
-        affected_pods[pod_id] = pod_data
-        pod_events.setdefault(pod_id, []).append(event)
-        # Find policies whoe PodSelector matches this pod
-        affected_policies = self._find_policies_for_pod(pod_data)
-        if affected_policies:
-            log.dbg("Event for pod %s affects %d network policies."
-                    "Generating policy events" % (
-                         pod_id, len(affected_policies)))
-        else:
-            log.dbg("Event for pod %s does not affect any network "
-                    "policy. No further processing needed" % pod_id)
-        # For each policy generate a policy update event and send it
-        # back to the queue
-        for policy_id, data in affected_policies:
-            policy = data['policy']
-            custom_policy_data = policy.setdefault('custom', {})
-            custom_policy_data.update({'from_changed': data['rules']})
-            get_event_queue().put((processor.NPEvent(
-                'UPDATED', policy['metadata']['name'], policy)))
+            # ACLs for this pod must be recalculated as label changes might
+            # imply the set of policies that apply to the pod changes
+            pod_id = pod_data['metadata']['uid']
+            affected_pods[pod_id] = pod_data
+            pod_events.setdefault(pod_id, []).append(event)
+        # A pod label change migt also imply changes to address sets
+        self.mode.delete_pod_from_address_sets(pod_data)
+        self.mode.add_pod_to_address_sets(pod_data)
 
-    def _process_np_event(self, event, affected_pods, pod_events,
-                          affected_policies):
+    def _process_np_event(self, event, affected_pods, pod_events):
         log.dbg("Processing event %s from network policy %s" % (
             event.event_type, event.source))
         namespace = event.metadata['metadata']['namespace']
         policy = event.source
         policy_data = event.metadata
+        policy_id = policy_data['metadata']['uid']
         if not kubernetes.is_namespace_isolated(variables.K8S_API_SERVER,
                                                 namespace):
             log.warn("Policy %s applied to non-isolated namespace:%s."
                      "Skipping processing" % (policy, namespace))
             return
-        # Retrieve pods matching policy selector
-        # TODO: use pod cache, even if doing the selector query is so easy
+
+        # Retrieve pods matching policy pod selector. ACLs for this policy
+        # must be created (or destroyed) for these pods
         pod_selector = policy_data.get('podSelector', {})
         pods = kubernetes.get_pods_by_namespace(
             variables.K8S_API_SERVER,
@@ -167,49 +105,118 @@ class PolicyProcessor(processor.BaseProcessor):
             pod_id = pod['metadata']['uid']
             affected_pods[pod_id] = pod
             pod_events.setdefault(pod_id, []).append(event)
-        from_changed = event.metadata.get('from_changed', False)
-        if from_changed:
-            policy_id = policy_data['metadata']['uid']
-            affected_policies[policy_id] = policy_data
-        return pods
+
+        if event.event_type == 'DELETED':
+            # Remove pseudo ACLs for policy and address sets for all of
+            # its rules
+            self.mode.destroy_address_set(namespace, policy_data)
+            self.mode.remove_pseudo_acls(policy_id)
+            log.dbg("Policy: %s (Namespace: %s): pseudo ACLs and address sets"
+                    "destroyed" % (policy_id, namespace))
+            return
+        else:
+            # As there is no MODIFIED event for policies, if we end up here
+            # we are hanndling an ADDED event
+            self.mode.create_address_set(namespace, policy_data)
+            self.mode.build_pseudo_acls(policy_data)
+            self.mode.add_pods_to_policy_address_sets(policy_data)
+            log.dbg("Policy: %s (Namespace: %s): pseudo ACLs and address sets"
+                    "created" % (policy_id, namespace))
+
+    def _apply_pod_ns_acls(self, pod_data, pod_events):
+        ns_events = [event for event in pod_events if
+                     isinstance(event, processor.NSEvent)]
+        if not ns_events:
+            return
+        namespace = pod_data['metadata']['namespace']
+        pod_name = pod_data['metadata']['name']
+        pod_id = pod_data['metadata']['uid']
+        log.dbg("Pod: %s (Namespace: %s)  - Applying ACL changes for "
+                "namespace events" % (pod_name, namespace))
+        # In some rare cases, there could multiple namespace events. The
+        # ns_events list reports then in the same order in which they were
+        # detected and is therefore reliable. We only check first and last as
+        # multiple transitions might nullify each other
+        if ns_events[0] == ns_events[-1]:
+            # Single event
+            ns_data = ns_events[-1].metadata
+            isolated_final = ns_data.get('custom', {}).get('isolated', False)
+        else:
+            ns_data_final = ns_events[-1].metadata
+            isolated_final = ns_data_final.get(
+                'custom', {}).get('isolated', False)
+            ns_data_initial = ns_events[0].metadata
+            isolated_initial = ns_data_initial.get(
+                'custom', {}).get('isolated', False)
+            if isolated_final == isolated_initial:
+                # Nothing actually changed
+                log.dbg("Pod: %s (Namespace: %s): initial and final "
+                        "namespace isolation status are identical (%s) - "
+                        "no processing necessary" %
+                        (pod_name. namespace, isolated_final))
+                return
+        if not isolated_final:
+            log.dbg("Pod: %s (Namespace: %s): not isolated, "
+                    "whitelisting traffic for pod" % (pod_name, namespace))
+            self.mode.whitelist_pod_traffic(pod_id, namespace, pod_name)
+            self.mode.remove_acls(pod_id)
+        else:
+            log.dbg("Pod: %s (Namespace: %s): isolated, "
+                    "adding drop-all default rule" % (pod_name, namespace))
+
+    def _apply_pod_acls(self, pod_data, pod_events, policies):
+        # Do shallow copy of pod events as the list will be modified
+        pod_events = pod_events[:]
+        pod_name = pod_data['metadata']['name']
+        pod_ns = pod_data['metadata']['namespace']
+
+        log.dbg("Pod: %s (Namespace: %s): applying ACLs..." % (
+            pod_name, pod_ns))
+        # Ceck for a namespace event. This might mean that there has
+        # been a translation from isolated to non-isolated and therefore
+        # all we have to do would be whitelisting traffic
+        self._apply_pod_ns_acls(pod_data, pod_events)
+        if kubernetes.is_namespace_isolated(
+                variables.K8S_API_SERVER, pod_ns):
+            # If we are here the namespace is isolated, and policies must
+            # be translated into acls
+            self.mode.apply_pod_policy_acls(pod_data, policies)
+        log.dbg("Pod: %s (Namespace: %s): ACLs applied" % (pod_name, pod_ns))
 
     def process_events(self, events):
         log.dbg("Processing %d events from queue" % len(events))
         affected_pods = {}
-        affected_policies = {}
         pod_events = {}
-        for event in events[:]:
+        for event in events:
             if isinstance(event, processor.NSEvent):
                 # namespace add -> create policy watcher
                 # namespace delete -> destory policy watcher
                 # namespace update -> check isolation property
                 self._process_ns_event(event, affected_pods, pod_events)
-            elif isinstance(event, processor.NPEvent):
+            if isinstance(event, processor.NPEvent):
                 # policy add -> create ACLs for affected pods
                 # policy delete -> remove ACLs for affected pods
-                self._process_np_event(event, affected_pods, pod_events,
-                                       affected_policies)
-            elif isinstance(event, processor.PodEvent):
+                self._process_np_event(event, affected_pods, pod_events)
+            if isinstance(event, processor.PodEvent):
                 # relevant policies must be applied to pod
                 # check policies that select pod in from clause
                 self._process_pod_event(event, affected_pods, pod_events)
 
-            events.remove(event)
-        for pod_id in affected_pods:
+        ns_policy_map = {}
+        for pod_id, pod_data in affected_pods.items():
+            pod_ns = pod_data['metadata']['namespace']
+            policies = ns_policy_map.get(
+                pod_ns, kubernetes.get_network_policies(
+                    variables.K8S_API_SERVER,
+                    pod_data['metadata']['namespace']))
+            ns_policy_map[pod_ns] = policies
             log.dbg("Rebuilding ACL for pod:%s because of:%s" %
                     (pod_id, "; ".join(['%s from %s' % (event.event_type,
                                                         event.source)
                                         for event in pod_events[pod_id]])))
+            self._apply_pod_acls(pod_data, pod_events[pod_id], policies)
 
-        for policy in affected_policies:
-            log.dbg("Affected policy: %s" % policy)
-
-        for event in events:
-            log.warn("Event %s from %s was not processed. ACLs might not be "
-                     "in sync with network policies" % (event.event_type,
-                                                        event.source))
-        else:
-            log.info("Event processing terminated.")
+        log.info("Event processing terminated.")
 
 
 def get_event_queue():
